@@ -335,7 +335,7 @@ local petSpellCache = setmetatable({}, {
 		
 		-- Check if it's a pet spell
 		local spellInfo = GetSpellBookItemInfo(spellID, Enum.SpellBookSpellBank.Pet)
-		if spellInfo and spellInfo.bookType == Enum.SpellBookType.PETACTION then
+		if spellInfo and spellInfo.itemType == Enum.SpellBookItemType.PetAction then
 			info.timestamp = GetTime()
 			info.isPetSpell = true
 			info.petActionSlot = nil -- Will be set when scanning pet bar
@@ -343,10 +343,11 @@ local petSpellCache = setmetatable({}, {
 			-- Get pet action info if available
 			if info.isPetSpell then
 				for i = 1, NUM_PET_ACTION_SLOTS do
-					local actionInfo = GetPetActionInfo(i)
-					if actionInfo and actionInfo.spellID == spellID then
+					local name, texture, isToken, isActive, autoCastAllowed, autoCastEnabled, spellId, checksRange, inRange = GetPetActionInfo(i)
+					if spellId and spellId == spellID then
 						info.petActionSlot = i
-						info.checksRange = actionInfo.checksRange
+						info.checksRange = checksRange
+						info.maxRange = 5 -- Default pet ability range
 						break
 					end
 				end
@@ -421,7 +422,7 @@ local function UpdatePetSpells()
 	-- Cache pet spells
 	for i = 1, numSpells do
 		local spellInfo = C_SpellBook.GetSpellBookItemInfo(i, Enum.SpellBookSpellBank.Pet)
-		if spellInfo and spellInfo.bookType == Enum.SpellBookType.PETACTION then
+		if spellInfo and spellInfo.itemType == Enum.SpellBookItemType.PetAction then
 			petSpellCache[spellInfo.spellID] = nil -- Force cache update
 		end
 	end
@@ -435,6 +436,19 @@ end
 local function OnEvent(self, event, ...)
 	if event == "SPELLS_CHANGED" or event == "PET_BAR_UPDATE" or (event == "UNIT_PET" and ... == "player") then
 		UpdatePetSpells()
+	elseif event == "UNIT_IN_RANGE_UPDATE" then
+		local unit = ...
+		-- Clear cached range checks for this unit
+		for k in pairs(RangeTable.Hostile.Results) do
+			if k:match("_" .. unit .. "$") then
+				RangeTable.Hostile.Results[k] = nil
+			end
+		end
+		for k in pairs(RangeTable.Friendly.Results) do
+			if k:match("_" .. unit .. "$") then
+				RangeTable.Friendly.Results[k] = nil
+			end
+		end
 	end
 end
 
@@ -443,6 +457,7 @@ Lib.updaterFrame:UnregisterAllEvents()
 Lib.updaterFrame:RegisterEvent("SPELLS_CHANGED")
 Lib.updaterFrame:RegisterEvent("PET_BAR_UPDATE")
 Lib.updaterFrame:RegisterEvent("UNIT_PET")
+Lib.updaterFrame:RegisterEvent("UNIT_IN_RANGE_UPDATE")
 Lib.updaterFrame:SetScript("OnEvent", OnEvent)
 Lib.updaterFrame:SetScript("OnUpdate", function(self, elapsed)
 	self.lastCleanup = (self.lastCleanup or 0) + elapsed
@@ -498,19 +513,18 @@ function Lib.IsSpellInRange(spellInput, unit)
 	-- Get cached range check if available
 	local cachedResult, cachedDistance = GetCachedRangeCheck(spellID, unit, isHostile)
 	if cachedResult ~= nil then
-		return cachedResult
+		return cachedResult and 1 or 0
 	end
 	
 	-- Handle pet spells specially
 	if spellInfo.isPetSpell then
 		-- Try pet action bar first if available
 		if spellInfo.petActionSlot then
-			local actionInfo = GetPetActionInfo(spellInfo.petActionSlot)
-			if actionInfo and actionInfo.checksRange then
-				local result = actionInfo.inRange
-				if result ~= nil then
-					SetCachedRangeCheck(spellID, unit, result, actionInfo.maxRange or 5, isHostile)
-					return result and 1 or 0
+			local name, texture, isToken, isActive, autoCastAllowed, autoCastEnabled, spellId, checksRange, inRange = GetPetActionInfo(spellInfo.petActionSlot)
+			if checksRange then
+				if inRange ~= nil then
+					SetCachedRangeCheck(spellID, unit, inRange, spellInfo.maxRange or 5, isHostile)
+					return inRange and 1 or 0
 				end
 			end
 		end
