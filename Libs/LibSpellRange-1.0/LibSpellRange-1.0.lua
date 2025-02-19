@@ -561,10 +561,19 @@ end
 
 -- Update SpellHasRange to use improved range info
 --- Returns whether a spell has a min and/or max range greater than 0
+--- This is an enhanced version of the base C_Spell.SpellHasRange API that adds:
+--- - Caching for performance optimization
+--- - Support for both spell IDs and spell names/hyperlinks
+--- - Proper handling of spell overrides from talents
+--- - Pet spell support
 --- @param spellInput number|string SpellID, name, or hyperlink of the spell to check
---- @return boolean|nil True if the spell has a range, false if it does not, nil if the query was invalid
+--- @return boolean|nil True if the spell has a range, false if it does not, nil if:
+---   - The spell does not exist
+---   - The spell data is not yet cached
+---   - The input is invalid or nil
 --- @see https://warcraft.wiki.gg/wiki/API_C_Spell.SpellHasRange
 function Lib.SpellHasRange(spellInput)
+	-- Quick return for nil input
 	if not spellInput then return nil end
 	
 	local spellID
@@ -572,33 +581,40 @@ function Lib.SpellHasRange(spellInput)
 	-- Handle numeric spell IDs with override checking
 	if type(spellInput) == "number" then
 		spellID = spellInput
+		-- Quick validation for obviously invalid spell IDs
+		if spellID <= 0 then return nil end
 	else
 		-- For string inputs, verify spell exists by getting its ID
+		if type(spellInput) ~= "string" then return nil end
 		spellID = GetSpellIDForSpellIdentifier(spellInput)
 	end
 	
 	if not spellID then return nil end
 	
-	-- Check spell exists and get info
+	-- Fast path: Check if we have cached info
 	local spellInfo = spellInfoCache[spellID]
+	if spellInfo and spellInfo.hasRange ~= nil then
+		return spellInfo.hasRange
+	end
+	
+	-- Check if it's a pet spell if no regular spell info found
 	if not spellInfo then
-		-- Check if it's a pet spell
 		spellInfo = petSpellCache[spellID]
 		if not spellInfo then return nil end
 	end
 	
-	-- Check for override spell
+	-- Check for override spell (e.g. from talents)
 	local overrideID = overrideCache[spellID]
 	if overrideID then
 		spellID = overrideID
 		-- Update spell info for override
 		spellInfo = spellInfoCache[overrideID] or petSpellCache[overrideID]
 		if not spellInfo then return nil end
-	end
-	
-	-- If we have cached range info, use it
-	if spellInfo.hasRange ~= nil then
-		return spellInfo.hasRange
+		
+		-- Fast path: Check override cached info
+		if spellInfo.hasRange ~= nil then
+			return spellInfo.hasRange
+		end
 	end
 	
 	-- Handle pet spells specially
@@ -615,26 +631,73 @@ function Lib.SpellHasRange(spellInput)
 		return result
 	end
 	
-	-- Check if spell has range
+	-- Check if spell has range using base API
 	local result = SpellHasRange(spellID)
-	spellInfo.hasRange = result
+	
+	-- Cache the result
+	if spellInfo then
+		spellInfo.hasRange = result
+		spellInfo.timestamp = GetTime()
+	end
+	
 	return result
 end
 
 --- Returns whether a spellbook item has range requirements
 --- Will always return false if it is not a spell
---- @param spellBookItemSlotIndex number The slot index in the spellbook
---- @param spellBookItemSpellBank Enum.SpellBookSpellBank The spellbook type (0 for Player, 1 for Pet)
---- @return boolean True if the spell has a range, false if it does not or is not a spell
+--- @param spellBookItemSlotIndex number The slot index in the spellbook (1-based index)
+--- @param spellBookItemSpellBank Enum.SpellBookSpellBank The spellbook type:
+---   - Enum.SpellBookSpellBank.Player (0) for player spells
+---   - Enum.SpellBookSpellBank.Pet (1) for pet spells
+--- @return boolean True if the spell has a range, false if:
+---   - The spell does not exist
+---   - The input is invalid
+---   - The spellbook item is not a spell
 --- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.SpellBookItemHasRange
 function Lib.SpellBookItemHasRange(spellBookItemSlotIndex, spellBookItemSpellBank)
-	if not spellBookItemSlotIndex or not spellBookItemSpellBank then return false end
+	-- Validate input parameters
+	if type(spellBookItemSlotIndex) ~= "number" or spellBookItemSlotIndex < 1 then 
+		return false 
+	end
+	
+	-- Validate spellbank enum
+	if spellBookItemSpellBank ~= Enum.SpellBookSpellBank.Player and 
+	   spellBookItemSpellBank ~= Enum.SpellBookSpellBank.Pet then
+		return false
+	end
 	
 	-- Get spell info to verify it's a valid spell
 	local spellInfo = GetSpellBookItemInfo(spellBookItemSlotIndex, spellBookItemSpellBank)
 	if not spellInfo then return false end
 	
-	return SpellBookItemHasRange(spellBookItemSlotIndex, spellBookItemSpellBank)
+	-- Verify it's actually a spell type
+	if spellInfo.itemType ~= Enum.SpellBookItemType.Spell and 
+	   spellInfo.itemType ~= Enum.SpellBookItemType.PetAction then
+		return false
+	end
+	
+	-- Check if we have this spell ID cached
+	if spellInfo.spellID then
+		local cachedInfo = spellInfoCache[spellInfo.spellID]
+		if cachedInfo and cachedInfo.hasRange ~= nil then
+			return cachedInfo.hasRange
+		end
+	end
+	
+	-- Get range info from base API
+	local result = SpellBookItemHasRange(spellBookItemSlotIndex, spellBookItemSpellBank)
+	
+	-- Cache the result if we have a spell ID
+	if spellInfo.spellID then
+		spellInfoCache[spellInfo.spellID] = {
+			hasRange = result,
+			timestamp = GetTime(),
+			isPetSpell = spellBookItemSpellBank == Enum.SpellBookSpellBank.Pet,
+			spellID = spellInfo.spellID
+		}
+	end
+	
+	return result
 end
 
 -- Initialize pet spells
