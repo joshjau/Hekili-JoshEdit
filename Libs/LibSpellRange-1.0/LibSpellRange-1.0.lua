@@ -49,6 +49,8 @@ local IsSpellInRange = C_Spell.IsSpellInRange -- Checks if target is within spel
 local SpellHasRange = C_Spell.SpellHasRange -- Checks if spell has range requirements
 
 --- @see https://warcraft.wiki.gg/wiki/API_C_Spell.GetOverrideSpell
+--- Gets the override spell ID for a given spell, if one exists.
+--- This is commonly used for spells that are modified by talents or other effects.
 local GetOverrideSpell = C_Spell.GetOverrideSpell -- Gets talent-modified version of spell
 
 --- @see https://warcraft.wiki.gg/wiki/API_C_Spell.GetSpellInfo
@@ -64,7 +66,34 @@ local GetSpellIDForSpellIdentifier = C_Spell.GetSpellIDForSpellIdentifier -- Get
 local HasPetSpells = C_SpellBook.HasPetSpells -- Gets number of pet spells and pet token
 
 --- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.GetSpellBookItemInfo
+--- Gets information about a spell in the spellbook
+--- Returns information about the specified spell book item, including:
+--- - Spell type (SPELL, PETACTION, FUTURESPELL, etc.)
+--- - Spell ID
+--- - Whether it's a passive ability
+--- - Whether it's disabled
+--- - Whether it's an offensive ability
+--- @type fun(index: number, spellBookType: Enum.SpellBookSpellBank): SpellBookInfo
 local GetSpellBookItemInfo = C_SpellBook.GetSpellBookItemInfo -- Gets spellbook item information
+
+---@enum SpellBookItemType
+local SpellBookItemType = {
+	None = 0,        -- No valid spell
+	Spell = 1,       -- Regular player spell
+	FutureSpell = 2, -- Spell not yet learned
+	PetAction = 3,   -- Pet ability
+	Flyout = 4       -- Spell flyout (like Warlock curses)
+}
+
+---@class SpellBookInfo
+---@field spellID number The unique identifier for the spell
+---@field itemType SpellBookItemType The type of spell book item
+---@field name string The localized name of the spell
+---@field subName string The spell's subtext (may be empty for flyouts or if spell data isn't loaded)
+---@field iconID number The spell icon texture FileID
+---@field isPassive boolean Whether the spell is passive
+---@field isOffSpec boolean Whether the spell belongs to a non-active specialization
+---@field skillLineIndex? number Index of the SkillLine this spell belongs to (nil if not part of a skill line)
 
 --- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.SpellBookItemHasRange
 local SpellBookItemHasRange = C_SpellBook.SpellBookItemHasRange -- Checks if spellbook item has range
@@ -80,8 +109,17 @@ local UnitIsEnemy = UnitIsEnemy -- Checks if a unit is hostile
 
 -- Constants
 --- Duration in seconds before cached range checks expire
+--- Increased from default 0.05 to 0.1 for better performance while maintaining accuracy
+--- This provides a good balance between responsiveness and CPU usage
 local RANGE_CACHE_DURATION = 0.1 -- 100ms cache duration for range checks
+
 --- Maximum number of spells to keep in the info cache
+--- Set to 1000 to balance memory usage with performance
+--- Most players have 100-300 spells, so this provides headroom for:
+--- - Base class abilities
+--- - Talent-modified spells
+--- - Temporary abilities (procs, items, etc.)
+--- - Pet abilities when relevant
 local SPELL_CACHE_SIZE = 1000 -- Maximum number of cached spells
 
 -- Range tables for different types of checks
@@ -244,15 +282,25 @@ local spellInfoCache = setmetatable({}, {
 	end
 })
 
+-- Cache key generator for override cache (internal use)
+local function GetOverrideCacheKey(spellID)
+	return tostring(spellID or 0)
+end
+
 -- Cache for spell override checks
 local overrideCache = setmetatable({}, {
 	__mode = "kv",
-	__index = function(t, spellID)
-		if not spellID or type(spellID) ~= "number" then return nil end
+	__index = function(t, key)
+		local spellID = tonumber(key)
+		
+		if not spellID or type(spellID) ~= "number" then 
+			t[key] = false
+			return false 
+		end
 		
 		-- Check if spell exists first
 		if not DoesSpellExist(spellID) then
-			t[spellID] = false
+			t[key] = false
 			return false
 		end
 		
@@ -261,28 +309,43 @@ local overrideCache = setmetatable({}, {
 		if not spell:IsSpellDataCached() then
 			spell:ContinueOnSpellLoad(function()
 				-- Force cache update when spell data is loaded
-				t[spellID] = nil
+				t[key] = nil
 			end)
 			return false
 		end
 		
 		-- Get override information
 		local overrideID = GetOverrideSpell(spellID)
-		if overrideID and overrideID ~= spellID then
-			-- Verify override spell exists and has range
-			if DoesSpellExist(overrideID) then
-				local overrideSpell = Spell:CreateFromSpellID(overrideID)
-				if overrideSpell:IsSpellDataCached() and SpellHasRange(overrideID) then
-					t[spellID] = overrideID
-					return overrideID
-				end
+		if not overrideID then
+			t[key] = false
+			return false
+		end
+		
+		-- Don't cache if the override is the same as input
+		if overrideID == spellID then
+			t[key] = false
+			return false
+		end
+		
+		-- Verify override spell exists and has range
+		if DoesSpellExist(overrideID) then
+			local overrideSpell = Spell:CreateFromSpellID(overrideID)
+			if overrideSpell:IsSpellDataCached() and SpellHasRange(overrideID) then
+				t[key] = overrideID
+				return overrideID
 			end
 		end
 		
-		t[spellID] = false
+		t[key] = false
 		return false
 	end
 })
+
+-- Helper function to get spell override (internal use)
+local function GetSpellOverride(spellID)
+	local key = GetOverrideCacheKey(spellID)
+	return overrideCache[key]
+end
 
 -- Helper function to check spellbook range
 --- Checks if a spell in the spellbook is within range of the target
@@ -334,7 +397,7 @@ local petSpellCache = setmetatable({}, {
 		end
 		
 		-- Check if it's a pet spell
-		local spellInfo = GetSpellBookItemInfo(spellID, Enum.SpellBookSpellBank.Pet)
+		local spellInfo = GetSpellBookInfoSafe(spellID, Enum.SpellBookSpellBank.Pet)
 		if spellInfo and spellInfo.itemType == Enum.SpellBookItemType.PetAction then
 			info.timestamp = GetTime()
 			info.isPetSpell = true
@@ -499,7 +562,7 @@ function Lib.IsSpellInRange(spellInput, unit)
 	end
 	
 	-- Check for override spell
-	local overrideID = overrideCache[spellID]
+	local overrideID = GetSpellOverride(spellID)
 	if overrideID then
 		spellID = overrideID
 		-- Update spell info for override
@@ -604,7 +667,7 @@ function Lib.SpellHasRange(spellInput)
 	end
 	
 	-- Check for override spell (e.g. from talents)
-	local overrideID = overrideCache[spellID]
+	local overrideID = GetSpellOverride(spellID)
 	if overrideID then
 		spellID = overrideID
 		-- Update spell info for override
@@ -667,7 +730,7 @@ function Lib.SpellBookItemHasRange(spellBookItemSlotIndex, spellBookItemSpellBan
 	end
 	
 	-- Get spell info to verify it's a valid spell
-	local spellInfo = GetSpellBookItemInfo(spellBookItemSlotIndex, spellBookItemSpellBank)
+	local spellInfo = GetSpellBookInfoSafe(spellBookItemSlotIndex, spellBookItemSpellBank)
 	if not spellInfo then return false end
 	
 	-- Verify it's actually a spell type
@@ -698,6 +761,36 @@ function Lib.SpellBookItemHasRange(spellBookItemSlotIndex, spellBookItemSpellBan
 	end
 	
 	return result
+end
+
+-- Helper function to safely get spellbook info with error handling
+--- Gets spell book information with proper error handling
+--- @param index number The index in the spell book
+--- @param spellBookType Enum.SpellBookSpellBank The spell book type to check
+--- @return SpellBookInfo|nil info The spell information if successful, nil if invalid
+local function GetSpellBookInfoSafe(index, spellBookType)
+	if type(index) ~= "number" or index < 1 then return nil end
+	if not spellBookType then return nil end
+	
+	local info = GetSpellBookItemInfo(index, spellBookType)
+	if not info then return nil end
+	
+	-- Ensure all fields are present with proper types
+	info.spellID = info.spellID or 0
+	info.itemType = info.itemType or SpellBookItemType.None
+	info.name = info.name or ""
+	info.subName = info.subName or ""
+	info.iconID = info.iconID or 0
+	info.isPassive = info.isPassive or false
+	info.isOffSpec = info.isOffSpec or false
+	info.skillLineIndex = info.skillLineIndex
+	
+	-- Validate item type
+	if info.itemType < SpellBookItemType.None or info.itemType > SpellBookItemType.Flyout then
+		info.itemType = SpellBookItemType.None
+	end
+	
+	return info
 end
 
 -- Initialize pet spells
