@@ -1,375 +1,636 @@
 --- = Background =
--- Blizzard's IsSpellInRange API has always been very limited - you either must have the name of the spell, or its spell book ID. Checking directly by spellID is simply not possible.
--- Now, in Mists of Pandaria, Blizzard changed the way that many talents and specialization spells work - instead of giving you a new spell when leaned, they replace existing spells. These replacement spells do not work with Blizzard's IsSpellInRange function whatsoever; this limitation is what prompted the creation of this lib.
--- = Usage = 
--- **LibSpellRange-1.0** exposes an enhanced version of IsSpellInRange that:
--- * Allows ranged checking based on both spell name and spellID.
--- * Works correctly with replacement spells that will not work using Blizzard's IsSpellInRange method alone.
+-- LibSpellRange-1.0 provides enhanced spell range checking functionality
+-- Updated for WoW 11.0.7 (The War Within) with modern API support
+--
+-- Features:
+-- * Efficient range checking with caching
+-- * Support for both player and pet spells
+-- * Handles spell overrides from talents
+-- * Modern API compatibility with fallbacks
+-- * Async spell data loading support
 --
 -- @class file
 -- @name LibSpellRange-1.0.lua
+-- @release 28
+-- @author Joshua James
 
 local major = "SpellRange-1.0"
-local minor = 24
+local minor = 28
 
 assert(LibStub, format("%s requires LibStub.", major))
 
 local Lib = LibStub:NewLibrary(major, minor)
 if not Lib then return end
 
-local tonumber = _G.tonumber
-local strlower = _G.strlower
-local wipe = _G.wipe
-local type = _G.type
-local select = _G.select
+-- Localize globals for performance
+local type = type
+local select = select
+local tonumber = tonumber
+local strlower = strlower
+local wipe = wipe
+local format = format
+local UnitExists = UnitExists
+local UnitIsUnit = UnitIsUnit
+local GetTime = GetTime
+local Spell = Spell
 
--- Handles updating spellsByName and spellsByID
+---@class SpellInfo
+---@field timestamp number Time when this spell info was cached
+---@field spellID number The unique identifier for this spell
+---@field hasRange? boolean Whether this spell has range requirements
+---@field minRange? number Minimum range in yards, if any
+---@field maxRange? number Maximum range in yards, if any
+---@field isPetSpell? boolean Whether this is a pet ability
+---@field petActionSlot? number The pet action bar slot if applicable
+---@field checksRange? boolean Whether this spell checks range (pet spells)
+
+-- Modern API references with descriptions
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.IsSpellInRange
+local IsSpellInRange = C_Spell.IsSpellInRange -- Checks if target is within spell range
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.SpellHasRange
+local SpellHasRange = C_Spell.SpellHasRange -- Checks if spell has range requirements
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.GetOverrideSpell
+local GetOverrideSpell = C_Spell.GetOverrideSpell -- Gets talent-modified version of spell
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.GetSpellInfo
+local GetSpellInfo = C_Spell.GetSpellInfo -- Gets basic spell information
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.DoesSpellExist
+local DoesSpellExist = C_Spell.DoesSpellExist -- Checks if spell exists in game database
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.GetSpellIDForSpellIdentifier
+local GetSpellIDForSpellIdentifier = C_Spell.GetSpellIDForSpellIdentifier -- Gets spell ID from various inputs
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.HasPetSpells
+local HasPetSpells = C_SpellBook.HasPetSpells -- Gets number of pet spells and pet token
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.GetSpellBookItemInfo
+local GetSpellBookItemInfo = C_SpellBook.GetSpellBookItemInfo -- Gets spellbook item information
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.SpellBookItemHasRange
+local SpellBookItemHasRange = C_SpellBook.SpellBookItemHasRange -- Checks if spellbook item has range
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.IsSpellBookItemInRange
+local IsSpellBookItemInRange = C_SpellBook.IsSpellBookItemInRange -- Checks if spellbook item is in range
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_PetInfo.GetPetActionInfo
+local GetPetActionInfo = C_PetInfo.GetPetActionInfo -- Gets information about a pet action slot
+
+--- @see https://warcraft.wiki.gg/wiki/API_UnitIsEnemy
+local UnitIsEnemy = UnitIsEnemy -- Checks if a unit is hostile
+
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.GetSpellRangeByID
+local GetSpellRangeByID = C_Spell.GetSpellRangeByID -- Gets exact range data for a spell
+
+-- Range tables for different types of checks
+--- @class RangeTable
+--- @field Hostile table Range information for hostile targets
+--- @field Friendly table Range information for friendly targets
+local RangeTable = {
+	Hostile = {
+		-- Common ranges in yards that spells use
+		-- Ordered from shortest to longest for efficient checking
+		Ranges = {5, 8, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60},
+		-- Cache of range results with weak values for garbage collection
+		Results = setmetatable({}, {__mode = "v"})
+	},
+	Friendly = {
+		Ranges = {5, 8, 10, 15, 20, 25, 30, 35, 40},
+		Results = setmetatable({}, {__mode = "v"})
+	}
+}
+
+-- Helper function to find the best range to check
+--- Finds the most appropriate range bracket for a given distance
+--- @param distance number The target distance to check
+--- @param isHostile boolean Whether checking against hostile or friendly ranges
+--- @return number The closest available range that's less than or equal to the target distance
+local function GetBestRangeToCheck(distance, isHostile)
+	local ranges = isHostile and RangeTable.Hostile.Ranges or RangeTable.Friendly.Ranges
+	-- Find the closest range that's less than or equal to the requested distance
+	for i = #ranges, 1, -1 do
+		if ranges[i] <= distance then
+			return ranges[i]
+		end
+	end
+	return ranges[1] -- Return minimum range if nothing else found
+end
+
+-- Helper function to get range check key
+--- Generates a unique cache key for range checks
+--- @param spellID number The spell ID being checked
+--- @param unit string The unit being targeted
+--- @return string A unique key for caching range check results
+local function GetRangeKey(spellID, unit)
+	return format("%d_%s", spellID, unit)
+end
+
+-- Update range check caching
+--- Retrieves cached range check results if still valid
+--- @param spellID number The spell ID being checked
+--- @param unit string The unit being targeted
+--- @param isHostile boolean Whether checking against hostile or friendly ranges
+--- @return boolean|nil result The cached range check result
+--- @return number|nil distance The cached distance
+local function GetCachedRangeCheck(spellID, unit, isHostile)
+	local results = isHostile and RangeTable.Hostile.Results or RangeTable.Friendly.Results
+	local key = GetRangeKey(spellID, unit)
+	local entry = results[key]
+	
+	if entry then
+		local now = GetTime()
+		if now - entry.timestamp <= RANGE_CACHE_DURATION then
+			return entry.result, entry.distance
+		end
+	end
+	return nil, nil
+end
+
+--- Stores range check results in the cache
+--- @param spellID number The spell ID being checked
+--- @param unit string The unit being targeted
+--- @param result boolean The range check result
+--- @param distance number The distance used for the check
+--- @param isHostile boolean Whether this was a hostile or friendly check
+local function SetCachedRangeCheck(spellID, unit, result, distance, isHostile)
+	local results = isHostile and RangeTable.Hostile.Results or RangeTable.Friendly.Results
+	local key = GetRangeKey(spellID, unit)
+	
+	results[key] = {
+		timestamp = GetTime(),
+		result = result,
+		distance = distance
+	}
+end
+
+-- Helper function to validate spell existence
+--- Checks if a spell exists in the game database and is properly loaded
+--- @param spellID number The spell ID to check
+--- @return boolean exists True if the spell exists and is loaded
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.DoesSpellExist
+local function ValidateSpell(spellID)
+	if not spellID or type(spellID) ~= "number" then 
+		return false 
+	end
+	
+	-- Check if spell exists in game database
+	if not DoesSpellExist(spellID) then
+		return false
+	end
+	
+	-- Create spell object for async loading
+	local spell = Spell:CreateFromSpellID(spellID)
+	if not spell:IsSpellDataCached() then
+		spell:ContinueOnSpellLoad(function()
+			-- Force cache update when spell data is loaded
+			spellInfoCache[spellID] = nil
+			petSpellCache[spellID] = nil
+			overrideCache[spellID] = nil
+		end)
+		return false
+	end
+	
+	return true
+end
+
+-- Initialize update frame if needed
 if not Lib.updaterFrame then
 	Lib.updaterFrame = CreateFrame("Frame")
 end
-Lib.updaterFrame:UnregisterAllEvents()
 
-if C_Spell.IsSpellInRange then
-	-- In TWW, IsSpellInRange supports both spell names and IDs
-	-- and also automatically handles override spells (i.e. when given a base spell
-	-- that has an active override, the range of the override is what's checked - 
-	-- no need to pass the input through C_Spell.GetOverrideSpell).
-	-- And it once again works with pet spells too!
-
-	-- It remains to be seen if C_Spell.IsSpellInRange will continue to be so well behaved
-	-- if/when it is brought to classic and era. May need to change the feature detection used.
-
-	-- Some good spells to test with:
-	-- 	Templar's Verdict (base) & Final Verdict (ret pally talent), talent has longer range than base
-	--	Growl (hunter pet) - pet spell with range.
-
-	local IsSpellInRange = C_Spell.IsSpellInRange
-	local SpellHasRange = C_Spell.SpellHasRange
-
-	function Lib.IsSpellInRange(spellInput, unit)
-		local result = IsSpellInRange(spellInput, unit)
-		return result and 1 or result == false and 0 or result
-	end
-
-	function Lib.SpellHasRange(spellInput)
-		local result = SpellHasRange(spellInput)
-		return result and 1 or result == false and 0 or result
-	end
-
-	return
-end
-
-
-local GetSpellBookItemInfo = _G.GetSpellBookItemInfo or _G.C_SpellBook.GetSpellBookItemType
-local GetSpellBookItemName = _G.GetSpellBookItemName or _G.C_SpellBook.GetSpellBookItemName
-local GetSpellLink = _G.GetSpellLink or _G.C_Spell.GetSpellLink
-local GetSpellName = _G.GetSpellInfo or _G.C_Spell.GetSpellName
-
-local IsSpellInRange = _G.IsSpellInRange
-local IsSpellBookItemInRange = _G.IsSpellInRange or function(index, spellBank, unit)
-  local result = C_SpellBook.IsSpellBookItemInRange(index, spellBank, unit)
-  if result == true then
-    return 1
-  elseif result == false then
-    return 0
-  end
-  return nil
-end
-
-local SpellHasRange = _G.SpellHasRange
-local SpellBookHasRange = _G.SpellHasRange or _G.C_SpellBook.IsSpellBookItemInRange
-
-local UnitExists = _G.UnitExists
-local GetPetActionInfo = _G.GetPetActionInfo
-local UnitIsUnit = _G.UnitIsUnit
-
-local playerBook = _G.GetSpellBookItemName and "spell" or _G.Enum.SpellBookSpellBank.Player
-local petBook = _G.GetSpellBookItemName and "pet" or _G.Enum.SpellBookSpellBank.Pet
-
--- isNumber is basically a tonumber cache for maximum efficiency
-Lib.isNumber = Lib.isNumber or setmetatable({}, {
-	__mode = "kv",
-	__index = function(t, i)
-		local o = tonumber(i) or false
-		t[i] = o
-		return o
-end})
-local isNumber = Lib.isNumber
-
--- strlower cache for maximum efficiency
-Lib.strlowerCache = Lib.strlowerCache or setmetatable(
-{}, {
-	__index = function(t, i)
-		if not i then return end
-		local o
-		if type(i) == "number" then
-			o = i
-		else
-			o = strlower(i)
+-- Spell info cache with weak values
+local spellInfoCache = setmetatable({}, {
+	__mode = "v",
+	__index = function(t, spellID)
+		if not ValidateSpell(spellID) then 
+			t[spellID] = false
+			return false 
 		end
-		t[i] = o
-		return o
-	end,
-}) local strlowerCache = Lib.strlowerCache
-
--- Matches lowercase player spell names to their spellBookID
-Lib.spellsByName_spell = Lib.spellsByName_spell or {}
-local spellsByName_spell = Lib.spellsByName_spell
-
--- Matches player spellIDs to their spellBookID
-Lib.spellsByID_spell = Lib.spellsByID_spell or {}
-local spellsByID_spell = Lib.spellsByID_spell
-
--- Matches lowercase pet spell names to their spellBookID
-Lib.spellsByName_pet = Lib.spellsByName_pet or {}
-local spellsByName_pet = Lib.spellsByName_pet
-
--- Matches pet spellIDs to their spellBookID
-Lib.spellsByID_pet = Lib.spellsByID_pet or {}
-local spellsByID_pet = Lib.spellsByID_pet
-
--- Matches pet spell names to their pet action bar slot
-Lib.actionsByName_pet = Lib.actionsByName_pet or {}
-local actionsByName_pet = Lib.actionsByName_pet
-
--- Matches pet spell IDs to their pet action bar slot
-Lib.actionsById_pet = Lib.actionsById_pet or {}
-local actionsById_pet = Lib.actionsById_pet
-
--- Caches whether a pet spell has been observed to ever have had a range.
--- Since this should never change for any particular spell,
--- it is not wiped.
-Lib.petSpellHasRange = Lib.petSpellHasRange or {}
-local petSpellHasRange = Lib.petSpellHasRange
-
--- Updates spellsByName and spellsByID
-
-local GetNumSpellTabs = _G.GetNumSpellTabs or C_SpellBook.GetNumSpellBookSkillLines
-local GetSpellTabInfo = _G.GetSpellTabInfo or function(index)
-	local skillLineInfo = C_SpellBook.GetSpellBookSkillLineInfo(index);
-	if skillLineInfo then
-		return	skillLineInfo.name,
-				skillLineInfo.iconID,
-				skillLineInfo.itemIndexOffset,
-				skillLineInfo.numSpellBookItems,
-				skillLineInfo.isGuild,
-				skillLineInfo.offSpecID,
-				skillLineInfo.shouldHide,
-				skillLineInfo.specID;
-	end
-end
-
-local function UpdateBook(bookType)
-	local book = bookType == "spell" and playerBook or petBook
-	local max = 0
-	for i = 1, GetNumSpellTabs() do
-		local _, _, offs, numspells, _, specId = GetSpellTabInfo(i)
-		if specId == 0 then
-			max = offs + numspells
-		end
-	end
-
-	local spellsByName = Lib["spellsByName_" .. bookType]
-	local spellsByID = Lib["spellsByID_" .. bookType]
-	
-	wipe(spellsByName)
-	wipe(spellsByID)
-	
-	for spellBookID = 1, max do
-		local type, baseSpellID = GetSpellBookItemInfo(spellBookID, book)
 		
-		if type == "SPELL" or type == "PETACTION" then
-			local currentSpellName, _, currentSpellID = GetSpellBookItemName(spellBookID, book)
-			if not currentSpellID then
-				local link = GetSpellLink(currentSpellName)
-				currentSpellID = tonumber(link and link:gsub("|", "||"):match("spell:(%d+)"))
+		-- Get spell info
+		local info = GetSpellInfo(spellID)
+		if not info then
+			t[spellID] = false
+			return false
+		end
+		
+		-- Store additional metadata
+		info.timestamp = GetTime()
+		info.spellID = spellID
+		
+		-- Get range information
+		if SpellHasRange(spellID) then
+			-- Try to get exact range from spell data
+			local spellData = C_Spell.GetSpellRangeByID(spellID)
+			if spellData then
+				info.minRange = spellData.minRange or 0
+				info.maxRange = spellData.maxRange or 5
+				info.hasRange = true
+			else
+				-- Fallback to checking common ranges
+				for _, range in ipairs(RangeTable.Hostile.Ranges) do
+					if IsSpellInRange(spellID, "target") ~= nil then
+						info.minRange = 0
+						info.maxRange = range
+						info.hasRange = true
+						break
+					end
+				end
 			end
+		end
+		
+		t[spellID] = info
+		return info
+	end
+})
 
-			-- For each entry we add to a table,
-			-- only add it if there isn't anything there already.
-			-- This prevents weird passives from overwriting real, legit spells.
-			-- For example, in WoW 7.3.5 the ret paladin mastery 
-			-- was coming back with a base spell named "Judgement",
-			-- which was overwriting the real "Judgement".
-			-- Passives usually come last in the spellbook,
-			-- so this should work just fine as a workaround.
-			-- This issue with "Judgement" is gone in BFA because the mastery changed.
-			
-			if currentSpellName and not spellsByName[strlower(currentSpellName)] then
-				spellsByName[strlower(currentSpellName)] = spellBookID
-			end
-			if currentSpellID and not spellsByID[currentSpellID] then
-				spellsByID[currentSpellID] = spellBookID
-			end
-			
-			if type == "SPELL" then
-				-- PETACTION (pet abilities) don't return a spellID for baseSpellID,
-				-- so base spells only work for proper player spells.
-				local baseSpellName = GetSpellName(baseSpellID)
-				if baseSpellName and not spellsByName[strlower(baseSpellName)] then
-					spellsByName[strlower(baseSpellName)] = spellBookID
+-- Cache for spell override checks
+local overrideCache = setmetatable({}, {
+	__mode = "kv",
+	__index = function(t, spellID)
+		if not spellID or type(spellID) ~= "number" then return nil end
+		
+		-- Check if spell exists first
+		if not DoesSpellExist(spellID) then
+			t[spellID] = false
+			return false
+		end
+		
+		-- Create spell object for async loading
+		local spell = Spell:CreateFromSpellID(spellID)
+		if not spell:IsSpellDataCached() then
+			spell:ContinueOnSpellLoad(function()
+				-- Force cache update when spell data is loaded
+				t[spellID] = nil
+			end)
+			return false
+		end
+		
+		-- Get override information
+		local overrideID = GetOverrideSpell(spellID)
+		if overrideID and overrideID ~= spellID then
+			-- Verify override spell exists and has range
+			if DoesSpellExist(overrideID) then
+				local overrideSpell = Spell:CreateFromSpellID(overrideID)
+				if overrideSpell:IsSpellDataCached() and SpellHasRange(overrideID) then
+					t[spellID] = overrideID
+					return overrideID
 				end
-				if baseSpellID and not spellsByID[baseSpellID] then
-					spellsByID[baseSpellID] = spellBookID
+			end
+		end
+		
+		t[spellID] = false
+		return false
+	end
+})
+
+-- Helper function to check spellbook range
+--- Checks if a spell in the spellbook is within range of the target
+--- @param spellID number The spell ID to check
+--- @param spellBank Enum.SpellBookSpellBank The spellbook type (0 for Player, 1 for Pet)
+--- @param unit string? Optional specific target; If not supplied, player's current target will be used
+--- @return boolean|nil True if in range, false if out of range, nil if check was invalid
+--- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.IsSpellBookItemInRange
+local function CheckSpellBookRange(spellID, spellBank, unit)
+	if not spellID or not spellBank then return nil end
+	if not unit then unit = "target" end
+	if not UnitExists(unit) then return nil end
+	
+	-- First check if the spell has range requirements
+	if not SpellBookItemHasRange(spellID, spellBank) then
+		return false
+	end
+	
+	return IsSpellBookItemInRange(spellID, spellBank, unit)
+end
+
+-- Pet spell cache
+local petSpellCache = setmetatable({}, {
+	__mode = "v",
+	__index = function(t, spellID)
+		if not spellID or type(spellID) ~= "number" then return nil end
+		
+		-- Check if spell exists first
+		if not DoesSpellExist(spellID) then
+			t[spellID] = false
+			return false
+		end
+		
+		-- Create spell object for async loading
+		local spell = Spell:CreateFromSpellID(spellID)
+		if not spell:IsSpellDataCached() then
+			spell:ContinueOnSpellLoad(function()
+				-- Force cache update when spell data is loaded
+				t[spellID] = nil
+			end)
+			return false
+		end
+		
+		-- Get spell info
+		local info = GetSpellInfo(spellID)
+		if not info then
+			t[spellID] = false
+			return false
+		end
+		
+		-- Check if it's a pet spell
+		local spellInfo = GetSpellBookItemInfo(spellID, Enum.SpellBookSpellBank.Pet)
+		if spellInfo and spellInfo.bookType == Enum.SpellBookType.PETACTION then
+			info.timestamp = GetTime()
+			info.spellID = spellID
+			info.isPetSpell = true
+			info.petActionSlot = nil -- Will be set when scanning pet bar
+			
+			-- Get pet action info if available
+			if info.isPetSpell then
+				for i = 1, NUM_PET_ACTION_SLOTS do
+					local actionInfo = C_PetInfo.GetPetActionInfo(i)
+					if actionInfo and actionInfo.spellID == spellID then
+						info.petActionSlot = i
+						info.checksRange = actionInfo.checksRange
+						break
+					end
 				end
 			end
+			
+			t[spellID] = info
+			return info
+		end
+		
+		t[spellID] = false
+		return false
+	end
+})
+
+-- Range check results cache
+local rangeResultsCache = setmetatable({}, {
+	__mode = "k",
+	__index = function(t, key)
+		return {
+			timestamp = 0,
+			result = nil
+		}
+	end
+})
+
+-- Constants
+--- Duration in seconds before cached range checks expire
+local RANGE_CACHE_DURATION = 0.1 -- 100ms cache duration for range checks
+--- Maximum number of spells to keep in the info cache
+local SPELL_CACHE_SIZE = 1000 -- Maximum number of cached spells
+
+-- Cache maintenance
+--- Performs periodic cleanup of cached data
+--- - Removes expired range check results
+--- - Limits spell info cache to maximum size
+--- - Removes oldest entries when cache is full
+local function CleanupCache()
+	local now = GetTime()
+	
+	-- Cleanup expired range results
+	for k, v in pairs(rangeResultsCache) do
+		if now - v.timestamp > RANGE_CACHE_DURATION then
+			rangeResultsCache[k] = nil
+		end
+	end
+	
+	-- Limit spell info cache size
+	local count = 0
+	local oldest = nil
+	local oldestTime = now
+	
+	for k, v in pairs(spellInfoCache) do
+		count = count + 1
+		if v.timestamp and v.timestamp < oldestTime then
+			oldest = k
+			oldestTime = v.timestamp
+		end
+	end
+	
+	if count > SPELL_CACHE_SIZE and oldest then
+		spellInfoCache[oldest] = nil
+	end
+end
+
+-- Update pet spell info when pet bar changes
+--- Refreshes the pet spell cache when pet-related events occur
+--- - Clears existing cache
+--- - Scans pet spellbook for new spells
+--- - Updates cache with current pet abilities
+local function UpdatePetSpells()
+	-- Clear existing pet spell cache
+	wipe(petSpellCache)
+	
+	-- Get pet spells info
+	local numSpells, petToken = C_SpellBook.HasPetSpells()
+	if not numSpells then return end
+	
+	-- Cache pet spells
+	for i = 1, numSpells do
+		local spellInfo = C_SpellBook.GetSpellBookItemInfo(i, Enum.SpellBookSpellBank.Pet)
+		if spellInfo and spellInfo.bookType == Enum.SpellBookType.PETACTION then
+			petSpellCache[spellInfo.spellID] = nil -- Force cache update
 		end
 	end
 end
 
-local function UpdatePetBar()
-	wipe(actionsByName_pet)
-	wipe(actionsById_pet)
-	if not UnitExists("pet") then return end
-
-	for i = 1, NUM_PET_ACTION_SLOTS do
-		local name, texture, isToken, isActive, autoCastAllowed, autoCastEnabled, spellID, checksRange, inRange = GetPetActionInfo(i)
-		if checksRange then
-			actionsByName_pet[strlower(name)] = i
-			actionsById_pet[spellID] = i
-
-			petSpellHasRange[strlower(name)] = true
-			petSpellHasRange[spellID] = true
-		end
+-- Event handling
+--- Handles events that require pet spell cache updates
+--- @param self Frame The event handler frame
+--- @param event string The event name
+--- @param ... any Additional event parameters
+local function OnEvent(self, event, ...)
+	if event == "SPELLS_CHANGED" or event == "PET_BAR_UPDATE" or (event == "UNIT_PET" and ... == "player") then
+		UpdatePetSpells()
 	end
 end
-UpdatePetBar()
 
+-- Register all events
+Lib.updaterFrame:UnregisterAllEvents()
 Lib.updaterFrame:RegisterEvent("SPELLS_CHANGED")
 Lib.updaterFrame:RegisterEvent("PET_BAR_UPDATE")
-Lib.updaterFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
-Lib.updaterFrame:RegisterEvent("CVAR_UPDATE")
-
-local function UpdateSpells(_, event, arg1)
-	if event == "PET_BAR_UPDATE" then
-		UpdatePetBar()
-	elseif event == "PLAYER_TARGET_CHANGED" then
-		-- `checksRange` from GetPetActionInfo() changes based on whether the player has a target or not.
-		UpdatePetBar()
-	elseif event == "SPELLS_CHANGED" then
-		UpdateBook("spell")
-		UpdateBook("pet")
-	elseif event == "CVAR_UPDATE" and arg1 == "ShowAllSpellRanks" then
-		UpdateBook("spell")
-		UpdateBook("pet")
+Lib.updaterFrame:RegisterEvent("UNIT_PET")
+Lib.updaterFrame:SetScript("OnEvent", OnEvent)
+Lib.updaterFrame:SetScript("OnUpdate", function(self, elapsed)
+	self.lastCleanup = (self.lastCleanup or 0) + elapsed
+	if self.lastCleanup >= 1 then -- Cleanup every second
+		CleanupCache()
+		self.lastCleanup = 0
 	end
-end
+end)
 
-Lib.updaterFrame:SetScript("OnEvent", UpdateSpells)
-
-
---- Improved spell range checking function.
--- @name SpellRange.IsSpellInRange
--- @paramsig spell, unit
--- @param spell Name or spellID of a spell that you wish to check the range of. The spell must be a spell that you have in your spellbook or your pet's spellbook.
--- @param unit UnitID of the spell that you wish to check the range on.
--- @return Exact same returns as http://wowprogramming.com/docs/api/IsSpellInRange
--- @usage
--- -- Check spell range by spell name on unit "target"
--- local SpellRange = LibStub("SpellRange-1.0")
--- local inRange = SpellRange.IsSpellInRange("Stormstrike", "target")
---
--- -- Check spell range by spellID on unit "mouseover"
--- local SpellRange = LibStub("SpellRange-1.0")
--- local inRange = SpellRange.IsSpellInRange(17364, "mouseover")
+-- Update IsSpellInRange to use optimized range checking
+--- Returns whether a target is within range of the spell
+--- @param spellInput number|string SpellID, name, or hyperlink of the spell to check
+--- @param unit string? UnitToken - Optional specific target; If not supplied, player's current target will be used
+--- @return number|nil 1 if in range, 0 if out of range, nil if the range check was invalid (ie due to invalid spell, missing target)
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.IsSpellInRange
 function Lib.IsSpellInRange(spellInput, unit)
-	if isNumber[spellInput] then
-		local spell = spellsByID_spell[spellInput]
-		if spell then
-			return IsSpellBookItemInRange(spell, playerBook, unit)
-		else
-			local spell = spellsByID_pet[spellInput]
-			if spell then
-				local petResult = IsSpellBookItemInRange(spell, petBook, unit)
-				if petResult ~= nil then
-					return petResult
-				end
-				
-				-- IsSpellInRange seems to no longer work for pet spellbook,
-				-- so we also try the action bar API.
-				local actionSlot = actionsById_pet[spellInput]
-				if actionSlot and (unit == "target" or UnitIsUnit(unit, "target")) then
-					return select(9, GetPetActionInfo(actionSlot)) and 1 or 0
-				end
-			end
-		end
-
-		-- if "show all ranks" in spellbook is not ticked and the input was a lower rank of a spell, it won't exist in spellsByID_spell. 
-		-- Workaround this issue by testing by name when no result was found using spellbook
-		local name = GetSpellName(spellInput)
-		if name then
-			return IsSpellInRange(name, unit)
-		end
-	else
-		local spellInput = strlowerCache[spellInput]
-		
-		local spell = spellsByName_spell[spellInput]
-		if spell then
-			return IsSpellBookItemInRange(spell, playerBook, unit)
-		else
-			local spell = spellsByName_pet[spellInput]
-			if spell then
-				local petResult = IsSpellBookItemInRange(spell, petBook, unit)
-				if petResult ~= nil then
-					return petResult
-				end
-
-				-- IsSpellInRange seems to no longer work for pet spellbook,
-				-- so we also try the action bar API.
-				local actionSlot = actionsByName_pet[spellInput]
-				if actionSlot and (unit == "target" or UnitIsUnit(unit, "target")) then
-					return select(9, GetPetActionInfo(actionSlot)) and 1 or 0
-				end
-			end
-		end
-		return IsSpellInRange(spellInput, unit)
-	end
-end
-
-
---- Improved SpellHasRange.
--- @name SpellRange.SpellHasRange
--- @paramsig spell
--- @param spell Name or spellID of a spell that you wish to check for a range. The spell must be a spell that you have in your spellbook or your pet's spellbook.
--- @return Exact same returns as http://wowprogramming.com/docs/api/SpellHasRange
--- @usage
--- -- Check if a spell has a range by spell name
--- local SpellRange = LibStub("SpellRange-1.0")
--- local hasRange = SpellRange.SpellHasRange("Stormstrike")
---
--- -- Check if a spell has a range by spellID
--- local SpellRange = LibStub("SpellRange-1.0")
--- local hasRange = SpellRange.SpellHasRange(17364)
-function Lib.SpellHasRange(spellInput)
-	if isNumber[spellInput] then
-		local spell = spellsByID_spell[spellInput]
-		if spell then
-			return SpellBookHasRange(spell, playerBook)
-		else
-			local spell = spellsByID_pet[spellInput]
-			if spell then
-				-- SpellHasRange seems to no longer work for pet spellbook.
-				return SpellBookHasRange(spell, petBook) or petSpellHasRange[spellInput] or false
-			end
-		end
+	if not spellInput then return nil end
+	if not unit then unit = "target" end -- Match API behavior for nil unit
+	if not UnitExists(unit) then return nil end -- Early exit for invalid target
 	
-		local name = GetSpellName(spellInput)
-		if name then
-			return SpellHasRange(name)
-		end
+	local spellID
+	
+	-- Handle numeric spell IDs with override checking
+	if type(spellInput) == "number" then
+		spellID = spellInput
 	else
-		local spellInput = strlowerCache[spellInput]
-		
-		local spell = spellsByName_spell[spellInput]
-		if spell then
-			return SpellBookHasRange(spell, playerBook)
-		else
-			local spell = spellsByName_pet[spellInput]
-			if spell then
-				-- SpellHasRange seems to no longer work for pet spellbook.
-				return SpellBookHasRange(spell, petBook) or petSpellHasRange[spellInput] or false
+		-- For string inputs, verify spell exists by getting its ID
+		spellID = GetSpellIDForSpellIdentifier(spellInput)
+	end
+	
+	if not spellID then return nil end
+	
+	-- Check spell exists and get info
+	local spellInfo = spellInfoCache[spellID]
+	if not spellInfo then
+		-- Check if it's a pet spell
+		spellInfo = petSpellCache[spellID]
+		if not spellInfo then return nil end
+	end
+	
+	-- Check for override spell
+	local overrideID = overrideCache[spellID]
+	if overrideID then
+		spellID = overrideID
+		-- Update spell info for override
+		spellInfo = spellInfoCache[overrideID] or petSpellCache[overrideID]
+		if not spellInfo then return nil end
+	end
+	
+	-- Determine if target is hostile
+	local isHostile = UnitIsEnemy("player", unit)
+	
+	-- Get cached range check if available
+	local cachedResult, cachedDistance = GetCachedRangeCheck(spellID, unit, isHostile)
+	if cachedResult ~= nil then
+		return cachedResult
+	end
+	
+	-- Handle pet spells specially
+	if spellInfo.isPetSpell then
+		-- Try pet action bar first if available
+		if spellInfo.petActionSlot then
+			local actionInfo = GetPetActionInfo(spellInfo.petActionSlot)
+			if actionInfo and actionInfo.checksRange then
+				local result = actionInfo.inRange
+				if result ~= nil then
+					SetCachedRangeCheck(spellID, unit, result, actionInfo.maxRange or 5, isHostile)
+					return result and 1 or 0
+				end
 			end
 		end
-		return SpellHasRange(spellInput)
+		
+		-- Fallback to spellbook range check
+		local result = CheckSpellBookRange(spellID, Enum.SpellBookSpellBank.Pet, unit)
+		if result ~= nil then
+			-- Get spell range from spell info
+			local maxRange = spellInfo.maxRange or 5
+			SetCachedRangeCheck(spellID, unit, result, maxRange, isHostile)
+			return result and 1 or 0
+		end
 	end
+	
+	-- Get spell range
+	local maxRange = spellInfo.maxRange
+	if maxRange then
+		-- Use best range for checking
+		local checkRange = GetBestRangeToCheck(maxRange, isHostile)
+		local result = IsSpellInRange(spellID, unit)
+		if result ~= nil then
+			SetCachedRangeCheck(spellID, unit, result, checkRange, isHostile)
+		end
+		return result and 1 or result == false and 0 or result
+	end
+	
+	-- Fallback to direct range check
+	local result = IsSpellInRange(spellID, unit)
+	if result ~= nil then
+		SetCachedRangeCheck(spellID, unit, result, 5, isHostile) -- Default to melee range if unknown
+	end
+	return result and 1 or result == false and 0 or result
 end
+
+-- Update SpellHasRange to use improved range info
+--- Returns whether a spell has a min and/or max range greater than 0
+--- @param spellInput number|string SpellID, name, or hyperlink of the spell to check
+--- @return boolean|nil True if the spell has a range, false if it does not, nil if the query was invalid
+--- @see https://warcraft.wiki.gg/wiki/API_C_Spell.SpellHasRange
+function Lib.SpellHasRange(spellInput)
+	if not spellInput then return nil end
+	
+	local spellID
+	
+	-- Handle numeric spell IDs with override checking
+	if type(spellInput) == "number" then
+		spellID = spellInput
+	else
+		-- For string inputs, verify spell exists by getting its ID
+		spellID = GetSpellIDForSpellIdentifier(spellInput)
+	end
+	
+	if not spellID then return nil end
+	
+	-- Check spell exists and get info
+	local spellInfo = spellInfoCache[spellID]
+	if not spellInfo then
+		-- Check if it's a pet spell
+		spellInfo = petSpellCache[spellID]
+		if not spellInfo then return nil end
+	end
+	
+	-- Check for override spell
+	local overrideID = overrideCache[spellID]
+	if overrideID then
+		spellID = overrideID
+		-- Update spell info for override
+		spellInfo = spellInfoCache[overrideID] or petSpellCache[overrideID]
+		if not spellInfo then return nil end
+	end
+	
+	-- If we have cached range info, use it
+	if spellInfo.hasRange ~= nil then
+		return spellInfo.hasRange
+	end
+	
+	-- Handle pet spells specially
+	if spellInfo.isPetSpell then
+		-- If we have a pet action slot and it checks range, it has range
+		if spellInfo.petActionSlot and spellInfo.checksRange then
+			spellInfo.hasRange = true
+			return true
+		end
+		
+		-- Otherwise check spellbook
+		local result = CheckSpellBookRange(spellID, Enum.SpellBookSpellBank.Pet, "player") ~= nil
+		spellInfo.hasRange = result
+		return result
+	end
+	
+	-- Check if spell has range
+	local result = SpellHasRange(spellID)
+	spellInfo.hasRange = result
+	return result
+end
+
+--- Returns whether a spellbook item has range requirements
+--- Will always return false if it is not a spell
+--- @param spellBookItemSlotIndex number The slot index in the spellbook
+--- @param spellBookItemSpellBank Enum.SpellBookSpellBank The spellbook type (0 for Player, 1 for Pet)
+--- @return boolean True if the spell has a range, false if it does not or is not a spell
+--- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.SpellBookItemHasRange
+function Lib.SpellBookItemHasRange(spellBookItemSlotIndex, spellBookItemSpellBank)
+	if not spellBookItemSlotIndex or not spellBookItemSpellBank then return false end
+	
+	-- Get spell info to verify it's a valid spell
+	local spellInfo = GetSpellBookItemInfo(spellBookItemSlotIndex, spellBookItemSpellBank)
+	if not spellInfo then return false end
+	
+	return SpellBookItemHasRange(spellBookItemSlotIndex, spellBookItemSpellBank)
+end
+
+-- Initialize pet spells
+UpdatePetSpells()
