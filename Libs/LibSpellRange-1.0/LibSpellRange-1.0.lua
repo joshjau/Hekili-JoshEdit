@@ -36,10 +36,7 @@ local Spell = Spell
 
 ---@class SpellInfo
 ---@field timestamp number Time when this spell info was cached
----@field spellID number The unique identifier for this spell
 ---@field hasRange? boolean Whether this spell has range requirements
----@field minRange? number Minimum range in yards, if any
----@field maxRange? number Maximum range in yards, if any
 ---@field isPetSpell? boolean Whether this is a pet ability
 ---@field petActionSlot? number The pet action bar slot if applicable
 ---@field checksRange? boolean Whether this spell checks range (pet spells)
@@ -75,14 +72,17 @@ local SpellBookItemHasRange = C_SpellBook.SpellBookItemHasRange -- Checks if spe
 --- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.IsSpellBookItemInRange
 local IsSpellBookItemInRange = C_SpellBook.IsSpellBookItemInRange -- Checks if spellbook item is in range
 
---- @see https://warcraft.wiki.gg/wiki/API_C_PetInfo.GetPetActionInfo
-local GetPetActionInfo = C_PetInfo.GetPetActionInfo -- Gets information about a pet action slot
+--- @see https://warcraft.wiki.gg/wiki/API_GetPetActionInfo
+local GetPetActionInfo = GetPetActionInfo -- Gets information about a pet action slot (combat pet abilities)
 
 --- @see https://warcraft.wiki.gg/wiki/API_UnitIsEnemy
 local UnitIsEnemy = UnitIsEnemy -- Checks if a unit is hostile
 
---- @see https://warcraft.wiki.gg/wiki/API_C_Spell.GetSpellRangeByID
-local GetSpellRangeByID = C_Spell.GetSpellRangeByID -- Gets exact range data for a spell
+-- Constants
+--- Duration in seconds before cached range checks expire
+local RANGE_CACHE_DURATION = 0.1 -- 100ms cache duration for range checks
+--- Maximum number of spells to keep in the info cache
+local SPELL_CACHE_SIZE = 1000 -- Maximum number of cached spells
 
 -- Range tables for different types of checks
 --- @class RangeTable
@@ -218,23 +218,21 @@ local spellInfoCache = setmetatable({}, {
 		
 		-- Store additional metadata
 		info.timestamp = GetTime()
-		info.spellID = spellID
 		
 		-- Get range information
 		if SpellHasRange(spellID) then
-			-- Try to get exact range from spell data
-			local spellData = C_Spell.GetSpellRangeByID(spellID)
+			-- Try to get range from spell info
+			local spellData = GetSpellInfo(spellID)
 			if spellData then
-				info.minRange = spellData.minRange or 0
-				info.maxRange = spellData.maxRange or 5
 				info.hasRange = true
-			else
-				-- Fallback to checking common ranges
+				-- Default to melee range if no specific range found
+				info.minRange = 0
+				info.maxRange = 5
+
+				-- Check common ranges to find actual max range
 				for _, range in ipairs(RangeTable.Hostile.Ranges) do
 					if IsSpellInRange(spellID, "target") ~= nil then
-						info.minRange = 0
 						info.maxRange = range
-						info.hasRange = true
 						break
 					end
 				end
@@ -339,14 +337,13 @@ local petSpellCache = setmetatable({}, {
 		local spellInfo = GetSpellBookItemInfo(spellID, Enum.SpellBookSpellBank.Pet)
 		if spellInfo and spellInfo.bookType == Enum.SpellBookType.PETACTION then
 			info.timestamp = GetTime()
-			info.spellID = spellID
 			info.isPetSpell = true
 			info.petActionSlot = nil -- Will be set when scanning pet bar
 			
 			-- Get pet action info if available
 			if info.isPetSpell then
 				for i = 1, NUM_PET_ACTION_SLOTS do
-					local actionInfo = C_PetInfo.GetPetActionInfo(i)
+					local actionInfo = GetPetActionInfo(i)
 					if actionInfo and actionInfo.spellID == spellID then
 						info.petActionSlot = i
 						info.checksRange = actionInfo.checksRange
@@ -374,12 +371,6 @@ local rangeResultsCache = setmetatable({}, {
 		}
 	end
 })
-
--- Constants
---- Duration in seconds before cached range checks expire
-local RANGE_CACHE_DURATION = 0.1 -- 100ms cache duration for range checks
---- Maximum number of spells to keep in the info cache
-local SPELL_CACHE_SIZE = 1000 -- Maximum number of cached spells
 
 -- Cache maintenance
 --- Performs periodic cleanup of cached data
