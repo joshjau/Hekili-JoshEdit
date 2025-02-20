@@ -73,7 +73,7 @@ local HasPetSpells = C_SpellBook.HasPetSpells -- Gets number of pet spells and p
 --- - Whether it's a passive ability
 --- - Whether it's disabled
 --- - Whether it's an offensive ability
---- @type fun(index: number, spellBookType: Enum.SpellBookSpellBank): SpellBookInfo
+--- @type fun(index: number, spellBookType: Enum.SpellBookSpellBank): SpellBookItemInfo
 local GetSpellBookItemInfo = C_SpellBook.GetSpellBookItemInfo -- Gets spellbook item information
 
 ---@enum SpellBookItemType
@@ -94,6 +94,7 @@ local SpellBookItemType = {
 ---@field isPassive boolean Whether the spell is passive
 ---@field isOffSpec boolean Whether the spell belongs to a non-active specialization
 ---@field skillLineIndex? number Index of the SkillLine this spell belongs to (nil if not part of a skill line)
+---@field actionID? number For pet actions, stores the original action ID before any overrides (only set for pet spells)
 
 --- @see https://warcraft.wiki.gg/wiki/API_C_SpellBook.SpellBookItemHasRange
 local SpellBookItemHasRange = C_SpellBook.SpellBookItemHasRange -- Checks if spellbook item has range
@@ -286,8 +287,8 @@ local function CleanupCache()
 	local inCombat = InCombatLockdown()
 	
 	-- Cleanup expired range results with optimized iteration
-	for results, isHostile in pairs({[RangeTable.Hostile.Results]=true, [RangeTable.Friendly.Results]=false}) do
-		for k, v in pairs(results) do
+	if RangeTable and RangeTable.Hostile and RangeTable.Hostile.Results then
+		for k, v in pairs(RangeTable.Hostile.Results) do
 			local cacheDuration = RANGE_CACHE_DURATION
 			if inCombat then
 				cacheDuration = cacheDuration * 1.5
@@ -296,39 +297,84 @@ local function CleanupCache()
 				end
 			end
 			if now - v.timestamp > cacheDuration then
-				results[k] = nil
+				RangeTable.Hostile.Results[k] = nil
+			end
+		end
+	end
+	
+	if RangeTable and RangeTable.Friendly and RangeTable.Friendly.Results then
+		for k, v in pairs(RangeTable.Friendly.Results) do
+			local cacheDuration = RANGE_CACHE_DURATION
+			if inCombat then
+				cacheDuration = cacheDuration * 1.5
+				if v.isPetSpell or v.isStationary then
+					cacheDuration = cacheDuration * 1.2
+				end
+			end
+			if now - v.timestamp > cacheDuration then
+				RangeTable.Friendly.Results[k] = nil
 			end
 		end
 	end
 	
 	-- Optimize spell info cache with combat awareness
-	local count = 0
-	local oldest = nil
-	local oldestTime = now
+	if not spellInfoCache then return end
 	
 	-- Sort spells by priority for cache retention
 	local spells = {}
 	for k, v in pairs(spellInfoCache) do
-		table.insert(spells, {id = k, info = v})
+		if type(v) == "table" then
+			table.insert(spells, {id = k, info = v})
+		end
 	end
-	table.sort(spells, function(a, b)
-		-- Prioritize combat-used spells
-		if inCombat then
-			local aLastUse = a.info.lastCombatUse or 0
-			local bLastUse = b.info.lastCombatUse or 0
-			if aLastUse ~= bLastUse then
-				return aLastUse > bLastUse
+	
+	if #spells > 0 then
+		table.sort(spells, function(a, b)
+			-- Prioritize combat-used spells
+			if inCombat then
+				local aLastUse = a.info.lastCombatUse or 0
+				local bLastUse = b.info.lastCombatUse or 0
+				if aLastUse ~= bLastUse then
+					return aLastUse > bLastUse
+				end
+			end
+			return (a.info.timestamp or 0) > (b.info.timestamp or 0)
+		end)
+		
+		-- Remove oldest entries if cache is full
+		if #spells > SPELL_CACHE_SIZE then
+			for i = SPELL_CACHE_SIZE + 1, #spells do
+				spellInfoCache[spells[i].id] = nil
 			end
 		end
-		return (a.info.timestamp or 0) > (b.info.timestamp or 0)
-	end)
-	
-	-- Remove oldest entries if cache is full
-	if #spells > SPELL_CACHE_SIZE then
-		for i = SPELL_CACHE_SIZE + 1, #spells do
-			spellInfoCache[spells[i].id] = nil
-		end
 	end
+end
+
+-- Helper function to safely get spellbook info with error handling
+--- Gets spell book information with proper error handling and additional pet action handling
+--- This function provides a safe wrapper around C_SpellBook.GetSpellBookItemInfo with:
+--- - Input validation
+--- - Error handling
+--- - Special handling for pet actions
+--- - Additional fields for pet spells
+--- @param index number The index in the spell book (1-based)
+--- @param spellBookType Enum.SpellBookSpellBank The spell book type to check (Player = 0, Pet = 1)
+--- @return SpellBookItemInfo|nil info The spell information if successful, nil if invalid or error occurs
+local function GetSpellBookInfoSafe(index, spellBookType)
+	if type(index) ~= "number" or index < 1 then return nil end
+	if not spellBookType then return nil end
+	
+	-- Get spell info using C_SpellBook API
+	local spellInfo = C_SpellBook.GetSpellBookItemInfo(index, spellBookType)
+	if not spellInfo then return nil end
+	
+	-- For pet actions, we need to handle the action ID
+	if spellInfo.itemType == SpellBookItemType.PetAction then
+		-- Modern API already provides correct spellID
+		spellInfo.actionID = spellInfo.spellID
+	end
+	
+	return spellInfo
 end
 
 -- Initialize update frame if needed
@@ -458,11 +504,11 @@ local function CheckSpellBookRange(spellID, spellBank, unit)
 	if not UnitExists(unit) then return nil end
 	
 	-- First check if the spell has range requirements
-	if not SpellBookItemHasRange(spellID, spellBank) then
+	if not C_SpellBook.SpellBookItemHasRange(spellID, spellBank) then
 		return false
 	end
 	
-	return IsSpellBookItemInRange(spellID, spellBank, unit)
+	return C_SpellBook.IsSpellBookItemInRange(spellID, spellBank, unit)
 end
 
 -- Pet spell cache
@@ -472,7 +518,7 @@ local petSpellCache = setmetatable({}, {
 		if not spellID or type(spellID) ~= "number" then return nil end
 		
 		-- Check if spell exists first
-		if not DoesSpellExist(spellID) then
+		if not C_Spell.DoesSpellExist(spellID) then
 			t[spellID] = false
 			return false
 		end
@@ -488,34 +534,23 @@ local petSpellCache = setmetatable({}, {
 		end
 		
 		-- Get spell info
-		local info = GetSpellInfo(spellID)
-		if not info then
+		local spellInfo = C_Spell.GetSpellInfo(spellID)
+		if not spellInfo then
 			t[spellID] = false
 			return false
 		end
 		
 		-- Check if it's a pet spell
-		local spellInfo = GetSpellBookInfoSafe(spellID, Enum.SpellBookSpellBank.Pet)
-		if spellInfo and spellInfo.itemType == Enum.SpellBookItemType.PetAction then
-			info.timestamp = GetTime()
-			info.isPetSpell = true
-			info.petActionSlot = nil -- Will be set when scanning pet bar
+		local bookInfo = GetSpellBookInfoSafe(spellID, Enum.SpellBookSpellBank.Pet)
+		if bookInfo and bookInfo.itemType == SpellBookItemType.PetAction then
+			spellInfo.timestamp = GetTime()
+			spellInfo.isPetSpell = true
+			spellInfo.spellID = spellID
+			spellInfo.checksRange = C_SpellBook.SpellBookItemHasRange(spellID, Enum.SpellBookSpellBank.Pet)
+			spellInfo.maxRange = 5 -- Default pet ability range
 			
-			-- Get pet action info if available
-			if info.isPetSpell then
-				for i = 1, NUM_PET_ACTION_SLOTS do
-					local name, texture, isToken, isActive, autoCastAllowed, autoCastEnabled, spellId, checksRange, inRange = GetPetActionInfo(i)
-					if spellId and spellId == spellID then
-						info.petActionSlot = i
-						info.checksRange = checksRange
-						info.maxRange = 5 -- Default pet ability range
-						break
-					end
-				end
-			end
-			
-			t[spellID] = info
-			return info
+			t[spellID] = spellInfo
+			return spellInfo
 		end
 		
 		t[spellID] = false
@@ -540,7 +575,19 @@ local function UpdatePetSpells()
 	for i = 1, numSpells do
 		local spellInfo = C_SpellBook.GetSpellBookItemInfo(i, Enum.SpellBookSpellBank.Pet)
 		if spellInfo and spellInfo.itemType == Enum.SpellBookItemType.PetAction then
-			petSpellCache[spellInfo.spellID] = nil -- Force cache update
+			-- Ensure we have a valid spellID
+			if spellInfo.spellID and spellInfo.spellID > 0 then
+				-- Initialize new cache entry
+				petSpellCache[spellInfo.spellID] = {
+					timestamp = GetTime(),
+					isPetSpell = true,
+					spellID = spellInfo.spellID,
+					name = spellInfo.name,
+					hasRange = nil, -- Will be determined on first range check
+					checksRange = C_SpellBook.SpellBookItemHasRange(i, Enum.SpellBookSpellBank.Pet),
+					maxRange = 5 -- Default pet ability range
+				}
+			end
 		end
 	end
 end
@@ -603,7 +650,7 @@ function Lib.IsSpellInRange(spellInput, unit)
 	if type(spellInput) == "number" then
 		spellID = spellInput
 	else
-		spellID = GetSpellIDForSpellIdentifier(spellInput)
+		spellID = C_Spell.GetSpellIDForSpellIdentifier(spellInput)
 	end
 	
 	if not spellID then return nil end
@@ -621,7 +668,7 @@ function Lib.IsSpellInRange(spellInput, unit)
 	end
 	
 	-- Check for override spell
-	local overrideID = GetSpellOverride(spellID)
+	local overrideID = C_Spell.GetOverrideSpell(spellID)
 	if overrideID then
 		spellID = overrideID
 		-- Update spell info for override
@@ -640,23 +687,10 @@ function Lib.IsSpellInRange(spellInput, unit)
 	
 	-- Handle pet spells specially
 	if spellInfo.isPetSpell then
-		-- Try pet action bar first if available
-		if spellInfo.petActionSlot then
-			local name, texture, isToken, isActive, autoCastAllowed, autoCastEnabled, spellId, checksRange, inRange = GetPetActionInfo(spellInfo.petActionSlot)
-			if checksRange then
-				if inRange ~= nil then
-					SetCachedRangeCheck(spellID, unit, inRange, spellInfo.maxRange or 5, isHostile, true, false)
-					return inRange and 1 or 0
-				end
-			end
-		end
-		
-		-- Fallback to spellbook range check
-		local result = CheckSpellBookRange(spellID, Enum.SpellBookSpellBank.Pet, unit)
+		-- Check range using modern API
+		local result = C_SpellBook.IsSpellBookItemInRange(spellID, Enum.SpellBookSpellBank.Pet, unit)
 		if result ~= nil then
-			-- Get spell range from spell info
-			local maxRange = spellInfo.maxRange or 5
-			SetCachedRangeCheck(spellID, unit, result, maxRange, isHostile, true, false)
+			SetCachedRangeCheck(spellID, unit, result, spellInfo.maxRange or 5, isHostile, true, false)
 			return result and 1 or 0
 		end
 	end
@@ -666,7 +700,7 @@ function Lib.IsSpellInRange(spellInput, unit)
 	if maxRange then
 		-- Use best range for checking
 		local checkRange = GetBestRangeToCheck(maxRange, isHostile)
-		local result = IsSpellInRange(spellID, unit)
+		local result = C_Spell.IsSpellInRange(spellID, unit)
 		if result ~= nil then
 			SetCachedRangeCheck(spellID, unit, result, checkRange, isHostile, false, false)
 		end
@@ -674,7 +708,7 @@ function Lib.IsSpellInRange(spellInput, unit)
 	end
 	
 	-- Fallback to direct range check
-	local result = IsSpellInRange(spellID, unit)
+	local result = C_Spell.IsSpellInRange(spellID, unit)
 	if result ~= nil then
 		SetCachedRangeCheck(spellID, unit, result, 5, isHostile, false, false) -- Default to melee range if unknown
 	end
@@ -708,7 +742,7 @@ function Lib.SpellHasRange(spellInput)
 	else
 		-- For string inputs, verify spell exists by getting its ID
 		if type(spellInput) ~= "string" then return nil end
-		spellID = GetSpellIDForSpellIdentifier(spellInput)
+		spellID = C_Spell.GetSpellIDForSpellIdentifier(spellInput)
 	end
 	
 	if not spellID then return nil end
@@ -726,7 +760,7 @@ function Lib.SpellHasRange(spellInput)
 	end
 	
 	-- Check for override spell (e.g. from talents)
-	local overrideID = GetSpellOverride(spellID)
+	local overrideID = C_Spell.GetOverrideSpell(spellID)
 	if overrideID then
 		spellID = overrideID
 		-- Update spell info for override
@@ -820,36 +854,6 @@ function Lib.SpellBookItemHasRange(spellBookItemSlotIndex, spellBookItemSpellBan
 	end
 	
 	return result
-end
-
--- Helper function to safely get spellbook info with error handling
---- Gets spell book information with proper error handling
---- @param index number The index in the spell book
---- @param spellBookType Enum.SpellBookSpellBank The spell book type to check
---- @return SpellBookInfo|nil info The spell information if successful, nil if invalid
-local function GetSpellBookInfoSafe(index, spellBookType)
-	if type(index) ~= "number" or index < 1 then return nil end
-	if not spellBookType then return nil end
-	
-	local info = GetSpellBookItemInfo(index, spellBookType)
-	if not info then return nil end
-	
-	-- Ensure all fields are present with proper types
-	info.spellID = info.spellID or 0
-	info.itemType = info.itemType or SpellBookItemType.None
-	info.name = info.name or ""
-	info.subName = info.subName or ""
-	info.iconID = info.iconID or 0
-	info.isPassive = info.isPassive or false
-	info.isOffSpec = info.isOffSpec or false
-	info.skillLineIndex = info.skillLineIndex
-	
-	-- Validate item type
-	if info.itemType < SpellBookItemType.None or info.itemType > SpellBookItemType.Flyout then
-		info.itemType = SpellBookItemType.None
-	end
-	
-	return info
 end
 
 -- Initialize pet spells
