@@ -18,10 +18,6 @@ I am releasing a publicly available, open-source version of my Hekili cut. This 
 Why am I doing this?  
 Hekili and Syrif haven't embraced my suggestions and ideas, perhaps because I'm not a professional coder (and I do use some AI assistance). I plan to support mainly the specs I play or those used by friends. This project is not meant to replace Hekili's original version—if you prefer the original, stick with it. However, if you find this version better suited to your needs, then that's great!
 
-## License
-
-*Please include your license information here if applicable.*
-
 ## Contributing
 
 Contributions are welcome! Feel free to fork the repository and submit pull requests with improvements or bug fixes.
