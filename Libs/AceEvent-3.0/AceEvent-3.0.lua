@@ -157,6 +157,55 @@ local UpdateAddOnMemoryUsage = UpdateAddOnMemoryUsage
 local GetAddOnMemoryUsage = GetAddOnMemoryUsage
 local gcinfo = gcinfo
 local collectgarbage = collectgarbage
+local C_Timer = C_Timer
+
+-- Timer handling for buffered events
+local BUFFER_PROCESS_INTERVAL = 0.1 -- Process buffered events every 100ms
+local bufferTimer = nil
+
+-- Process buffered events safely
+local function ProcessBufferedEvents()
+    if not AceEvent.eventBuffer then return end
+    
+    local currentTime = GetTime()
+    local processedCount = 0
+    
+    -- Process up to 50 events per batch to prevent frame drops
+    while processedCount < 50 and #AceEvent.eventBuffer > 0 do
+        local eventData = table.remove(AceEvent.eventBuffer, 1)
+        if eventData then
+            AceEvent.events:Fire(eventData.eventType, eventData)
+            ReleaseEventData(eventData)
+            processedCount = processedCount + 1
+        end
+    end
+    
+    -- Schedule next processing if there are remaining events
+    if #AceEvent.eventBuffer > 0 then
+        bufferTimer = C_Timer.After(BUFFER_PROCESS_INTERVAL, ProcessBufferedEvents)
+    else
+        bufferTimer = nil
+    end
+end
+
+-- Enhanced event buffering
+local function BufferEvent(eventData)
+    if not AceEvent.eventBuffer then
+        AceEvent.eventBuffer = {}
+    end
+    
+    if #AceEvent.eventBuffer < MAX_BUFFER_SIZE then
+        AceEvent.eventBuffer[#AceEvent.eventBuffer + 1] = eventData
+        
+        -- Start processing timer if not already running
+        if not bufferTimer then
+            bufferTimer = C_Timer.After(BUFFER_PROCESS_INTERVAL, ProcessBufferedEvents)
+        end
+        return true
+    end
+    
+    return false
+end
 
 -- Initialize core tables
 AceEvent.eventPool = AceEvent.eventPool or {}
@@ -769,15 +818,15 @@ local function ProcessCombatLogEvent()
     -- Standard path for normal priority events
     local currentTime = GetTime()
     if BUFFER_EVENTS[eventType] and (currentTime - AceEvent.lastEventTime) < BUFFER_THRESHOLD then
-        if #AceEvent.eventBuffer < MAX_BUFFER_SIZE then
-            -- Basic event data for buffered events
-            eventData.timestamp = timestamp
-            eventData.eventType = eventType
-            eventData.sourceGUID = sourceGUID
-            eventData.destGUID = destGUID
-            eventData.spellID = spellID
-            AceEvent.eventBuffer[#AceEvent.eventBuffer + 1] = eventData
-        else
+        -- Prepare event data for buffering
+        eventData.timestamp = timestamp
+        eventData.eventType = eventType
+        eventData.sourceGUID = sourceGUID
+        eventData.destGUID = destGUID
+        eventData.spellID = spellID
+        
+        -- Try to buffer the event
+        if not BufferEvent(eventData) then
             ReleaseEventData(eventData)
         end
         return
