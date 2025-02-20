@@ -109,18 +109,26 @@ local UnitIsEnemy = UnitIsEnemy -- Checks if a unit is hostile
 
 -- Constants
 --- Duration in seconds before cached range checks expire
---- Increased from default 0.05 to 0.1 for better performance while maintaining accuracy
---- This provides a good balance between responsiveness and CPU usage
-local RANGE_CACHE_DURATION = 0.1 -- 100ms cache duration for range checks
+--- Optimized for Hekili's rotation calculations:
+--- - 0.15s for better performance while maintaining accuracy
+--- - Slightly longer than default to reduce checks during rapid ability usage
+--- - Still short enough to catch important range changes
+local RANGE_CACHE_DURATION = 0.15 -- Increased from 0.1 for better Hekili performance
 
 --- Maximum number of spells to keep in the info cache
---- Set to 1000 to balance memory usage with performance
---- Most players have 100-300 spells, so this provides headroom for:
---- - Base class abilities
---- - Talent-modified spells
---- - Temporary abilities (procs, items, etc.)
---- - Pet abilities when relevant
-local SPELL_CACHE_SIZE = 1000 -- Maximum number of cached spells
+--- Optimized for Hekili's typical rotation needs:
+--- - Most specs use 20-40 core abilities
+--- - Extra room for procs and modified abilities
+--- - Reduced from 1000 to save memory while covering all needed spells
+local SPELL_CACHE_SIZE = 250 -- Reduced from 1000 to optimize for Hekili's needs
+
+-- Use high-precision timer for critical timing operations
+local GetPreciseTime = GetTimePreciseSec or GetTime
+
+-- Helper function for defensive unit method checking
+local function SafeUnitMethod(unit, methodName, defaultValue)
+	return type(unit[methodName]) == "function" and unit[methodName](unit) or defaultValue
+end
 
 -- Range tables for different types of checks
 --- @class RangeTable
@@ -130,6 +138,7 @@ local RangeTable = {
 	Hostile = {
 		-- Common ranges in yards that spells use
 		-- Ordered from shortest to longest for efficient checking
+		-- Optimized for DPS calculations with most common combat ranges first
 		Ranges = {5, 8, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60},
 		-- Cache of range results with weak values for garbage collection
 		Results = setmetatable({}, {__mode = "v"})
@@ -156,53 +165,6 @@ local function GetBestRangeToCheck(distance, isHostile)
 	return ranges[1] -- Return minimum range if nothing else found
 end
 
--- Helper function to get range check key
---- Generates a unique cache key for range checks
---- @param spellID number The spell ID being checked
---- @param unit string The unit being targeted
---- @return string A unique key for caching range check results
-local function GetRangeKey(spellID, unit)
-	return format("%d_%s", spellID, unit)
-end
-
--- Update range check caching
---- Retrieves cached range check results if still valid
---- @param spellID number The spell ID being checked
---- @param unit string The unit being targeted
---- @param isHostile boolean Whether checking against hostile or friendly ranges
---- @return boolean|nil result The cached range check result
---- @return number|nil distance The cached distance
-local function GetCachedRangeCheck(spellID, unit, isHostile)
-	local results = isHostile and RangeTable.Hostile.Results or RangeTable.Friendly.Results
-	local key = GetRangeKey(spellID, unit)
-	local entry = results[key]
-	
-	if entry then
-		local now = GetTime()
-		if now - entry.timestamp <= RANGE_CACHE_DURATION then
-			return entry.result, entry.distance
-		end
-	end
-	return nil, nil
-end
-
---- Stores range check results in the cache
---- @param spellID number The spell ID being checked
---- @param unit string The unit being targeted
---- @param result boolean The range check result
---- @param distance number The distance used for the check
---- @param isHostile boolean Whether this was a hostile or friendly check
-local function SetCachedRangeCheck(spellID, unit, result, distance, isHostile)
-	local results = isHostile and RangeTable.Hostile.Results or RangeTable.Friendly.Results
-	local key = GetRangeKey(spellID, unit)
-	
-	results[key] = {
-		timestamp = GetTime(),
-		result = result,
-		distance = distance
-	}
-end
-
 -- Helper function to validate spell existence
 --- Checks if a spell exists in the game database and is properly loaded
 --- @param spellID number The spell ID to check
@@ -223,14 +185,150 @@ local function ValidateSpell(spellID)
 	if not spell:IsSpellDataCached() then
 		spell:ContinueOnSpellLoad(function()
 			-- Force cache update when spell data is loaded
+			-- Clear all related caches to ensure consistency
 			spellInfoCache[spellID] = nil
 			petSpellCache[spellID] = nil
 			overrideCache[spellID] = nil
+			-- Clear range cache entries for this spell
+			for k in pairs(RangeTable.Hostile.Results) do
+				if k:match("^" .. spellID .. "_") then
+					RangeTable.Hostile.Results[k] = nil
+				end
+			end
+			for k in pairs(RangeTable.Friendly.Results) do
+				if k:match("^" .. spellID .. "_") then
+					RangeTable.Friendly.Results[k] = nil
+				end
+			end
 		end)
 		return false
 	end
 	
 	return true
+end
+
+-- Helper function to get range check key
+--- Generates a unique cache key for range checks
+--- Optimized for Hekili's state tracking
+--- @param spellID number The spell ID being checked
+--- @param unit string The unit being targeted
+--- @return string A unique key for caching range check results
+local function GetRangeKey(spellID, unit)
+	-- For Hekili integration, include combat state, spec, and haste (for range modifications)
+	local spec = select(2, GetSpecializationInfo(GetSpecialization() or 0)) or ""
+	local inCombat = InCombatLockdown() and "c" or "n"
+	local haste = ("%.2f"):format(UnitSpellHaste("player") or 0)
+	return format("%d_%s_%s_%s_%s", spellID, unit, spec, inCombat, haste)
+end
+
+-- Update range check caching
+--- Retrieves cached range check results if still valid
+--- Optimized for Hekili's rotation calculations
+--- @param spellID number The spell ID being checked
+--- @param unit string The unit being targeted
+--- @param isHostile boolean Whether checking against hostile or friendly ranges
+--- @return boolean|nil result The cached range check result
+--- @return number|nil distance The cached distance
+local function GetCachedRangeCheck(spellID, unit, isHostile)
+	if not spellID or not unit then return nil, nil end
+	if not UnitExists(unit) then return nil, nil end
+	
+	local results = isHostile and RangeTable.Hostile.Results or RangeTable.Friendly.Results
+	local key = GetRangeKey(spellID, unit)
+	local entry = results[key]
+	
+	if entry then
+		local now = GetPreciseTime()
+		-- Optimize cache duration based on combat state and target type
+		local cacheDuration = RANGE_CACHE_DURATION
+		if InCombatLockdown() then
+			-- Extend cache in combat for better performance
+			cacheDuration = cacheDuration * 1.5
+			-- Further extend for pet abilities and non-movement intensive spells
+			if entry.isPetSpell or entry.isStationary then
+				cacheDuration = cacheDuration * 1.2
+			end
+		end
+		
+		if now - entry.timestamp <= cacheDuration then
+			return entry.result, entry.distance
+		end
+	end
+	return nil, nil
+end
+
+--- Stores range check results in the cache
+--- @param spellID number The spell ID being checked
+--- @param unit string The unit being targeted
+--- @param result boolean The range check result
+--- @param distance number The distance used for the check
+--- @param isHostile boolean Whether this was a hostile or friendly check
+--- @param isPetSpell boolean? Whether this is a pet ability
+--- @param isStationary boolean? Whether this is a non-movement intensive spell
+local function SetCachedRangeCheck(spellID, unit, result, distance, isHostile, isPetSpell, isStationary)
+	local results = isHostile and RangeTable.Hostile.Results or RangeTable.Friendly.Results
+	local key = GetRangeKey(spellID, unit)
+	
+	results[key] = {
+		timestamp = GetPreciseTime(),
+		result = result,
+		distance = distance,
+		isPetSpell = isPetSpell,
+		isStationary = isStationary
+	}
+end
+
+-- Cache maintenance
+--- Performs periodic cleanup of cached data
+--- Optimized for Hekili's performance needs
+local function CleanupCache()
+	local now = GetPreciseTime()
+	local inCombat = InCombatLockdown()
+	
+	-- Cleanup expired range results with optimized iteration
+	for results, isHostile in pairs({[RangeTable.Hostile.Results]=true, [RangeTable.Friendly.Results]=false}) do
+		for k, v in pairs(results) do
+			local cacheDuration = RANGE_CACHE_DURATION
+			if inCombat then
+				cacheDuration = cacheDuration * 1.5
+				if v.isPetSpell or v.isStationary then
+					cacheDuration = cacheDuration * 1.2
+				end
+			end
+			if now - v.timestamp > cacheDuration then
+				results[k] = nil
+			end
+		end
+	end
+	
+	-- Optimize spell info cache with combat awareness
+	local count = 0
+	local oldest = nil
+	local oldestTime = now
+	
+	-- Sort spells by priority for cache retention
+	local spells = {}
+	for k, v in pairs(spellInfoCache) do
+		table.insert(spells, {id = k, info = v})
+	end
+	table.sort(spells, function(a, b)
+		-- Prioritize combat-used spells
+		if inCombat then
+			local aLastUse = a.info.lastCombatUse or 0
+			local bLastUse = b.info.lastCombatUse or 0
+			if aLastUse ~= bLastUse then
+				return aLastUse > bLastUse
+			end
+		end
+		return (a.info.timestamp or 0) > (b.info.timestamp or 0)
+	end)
+	
+	-- Remove oldest entries if cache is full
+	if #spells > SPELL_CACHE_SIZE then
+		for i = SPELL_CACHE_SIZE + 1, #spells do
+			spellInfoCache[spells[i].id] = nil
+		end
+	end
 end
 
 -- Initialize update frame if needed
@@ -425,50 +523,6 @@ local petSpellCache = setmetatable({}, {
 	end
 })
 
--- Range check results cache
-local rangeResultsCache = setmetatable({}, {
-	__mode = "k",
-	__index = function(t, key)
-		return {
-			timestamp = 0,
-			result = nil
-		}
-	end
-})
-
--- Cache maintenance
---- Performs periodic cleanup of cached data
---- - Removes expired range check results
---- - Limits spell info cache to maximum size
---- - Removes oldest entries when cache is full
-local function CleanupCache()
-	local now = GetTime()
-	
-	-- Cleanup expired range results
-	for k, v in pairs(rangeResultsCache) do
-		if now - v.timestamp > RANGE_CACHE_DURATION then
-			rangeResultsCache[k] = nil
-		end
-	end
-	
-	-- Limit spell info cache size
-	local count = 0
-	local oldest = nil
-	local oldestTime = now
-	
-	for k, v in pairs(spellInfoCache) do
-		count = count + 1
-		if v.timestamp and v.timestamp < oldestTime then
-			oldest = k
-			oldestTime = v.timestamp
-		end
-	end
-	
-	if count > SPELL_CACHE_SIZE and oldest then
-		spellInfoCache[oldest] = nil
-	end
-end
-
 -- Update pet spell info when pet bar changes
 --- Refreshes the pet spell cache when pet-related events occur
 --- - Clears existing cache
@@ -532,14 +586,16 @@ end)
 
 -- Update IsSpellInRange to use optimized range checking
 --- Returns whether a target is within range of the spell
+--- Optimized for Hekili's DPS calculations
 --- @param spellInput number|string SpellID, name, or hyperlink of the spell to check
 --- @param unit string? UnitToken - Optional specific target; If not supplied, player's current target will be used
 --- @return number|nil 1 if in range, 0 if out of range, nil if the range check was invalid (ie due to invalid spell, missing target)
 --- @see https://warcraft.wiki.gg/wiki/API_C_Spell.IsSpellInRange
 function Lib.IsSpellInRange(spellInput, unit)
+	-- Quick return for nil input
 	if not spellInput then return nil end
-	if not unit then unit = "target" end -- Match API behavior for nil unit
-	if not UnitExists(unit) then return nil end -- Early exit for invalid target
+	if not unit then unit = "target" end
+	if not UnitExists(unit) then return nil end
 	
 	local spellID
 	
@@ -547,7 +603,6 @@ function Lib.IsSpellInRange(spellInput, unit)
 	if type(spellInput) == "number" then
 		spellID = spellInput
 	else
-		-- For string inputs, verify spell exists by getting its ID
 		spellID = GetSpellIDForSpellIdentifier(spellInput)
 	end
 	
@@ -556,9 +611,13 @@ function Lib.IsSpellInRange(spellInput, unit)
 	-- Check spell exists and get info
 	local spellInfo = spellInfoCache[spellID]
 	if not spellInfo then
-		-- Check if it's a pet spell
 		spellInfo = petSpellCache[spellID]
 		if not spellInfo then return nil end
+	end
+	
+	-- Track combat usage for cache prioritization
+	if InCombatLockdown() then
+		spellInfo.lastCombatUse = GetTime()
 	end
 	
 	-- Check for override spell
@@ -586,7 +645,7 @@ function Lib.IsSpellInRange(spellInput, unit)
 			local name, texture, isToken, isActive, autoCastAllowed, autoCastEnabled, spellId, checksRange, inRange = GetPetActionInfo(spellInfo.petActionSlot)
 			if checksRange then
 				if inRange ~= nil then
-					SetCachedRangeCheck(spellID, unit, inRange, spellInfo.maxRange or 5, isHostile)
+					SetCachedRangeCheck(spellID, unit, inRange, spellInfo.maxRange or 5, isHostile, true, false)
 					return inRange and 1 or 0
 				end
 			end
@@ -597,7 +656,7 @@ function Lib.IsSpellInRange(spellInput, unit)
 		if result ~= nil then
 			-- Get spell range from spell info
 			local maxRange = spellInfo.maxRange or 5
-			SetCachedRangeCheck(spellID, unit, result, maxRange, isHostile)
+			SetCachedRangeCheck(spellID, unit, result, maxRange, isHostile, true, false)
 			return result and 1 or 0
 		end
 	end
@@ -609,7 +668,7 @@ function Lib.IsSpellInRange(spellInput, unit)
 		local checkRange = GetBestRangeToCheck(maxRange, isHostile)
 		local result = IsSpellInRange(spellID, unit)
 		if result ~= nil then
-			SetCachedRangeCheck(spellID, unit, result, checkRange, isHostile)
+			SetCachedRangeCheck(spellID, unit, result, checkRange, isHostile, false, false)
 		end
 		return result and 1 or result == false and 0 or result
 	end
@@ -617,7 +676,7 @@ function Lib.IsSpellInRange(spellInput, unit)
 	-- Fallback to direct range check
 	local result = IsSpellInRange(spellID, unit)
 	if result ~= nil then
-		SetCachedRangeCheck(spellID, unit, result, 5, isHostile) -- Default to melee range if unknown
+		SetCachedRangeCheck(spellID, unit, result, 5, isHostile, false, false) -- Default to melee range if unknown
 	end
 	return result and 1 or result == false and 0 or result
 end
